@@ -27,7 +27,7 @@ use Bitrix24\Exceptions\Bitrix24TokenIsInvalidException;
 use Bitrix24\Exceptions\Bitrix24WrongClientException;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
-
+use Illuminate\Support\Facades\Log;
 /**
  * Class Bitrix24
  *
@@ -189,8 +189,8 @@ class Bitrix24 implements iBitrix24
              */
             $this->log = new NullLogger();
         }
-        $this->setRetriesToConnectCount(1);
-        $this->setRetriesToConnectTimeout(1000000);
+        $this->setRetriesToConnectCount(10);
+        $this->setRetriesToConnectTimeout(30000000); // 30s
     }
 
     /**
@@ -515,12 +515,13 @@ class Bitrix24 implements iBitrix24
             CURLOPT_RETURNTRANSFER => true,
             CURLINFO_HEADER_OUT => true,
             CURLOPT_VERBOSE => true,
-            CURLOPT_CONNECTTIMEOUT => 65,
-            CURLOPT_TIMEOUT => 70,
+            CURLOPT_CONNECTTIMEOUT => 0,
+            CURLOPT_TIMEOUT => 82800,
             CURLOPT_USERAGENT => strtolower(__CLASS__ . '-PHP-SDK/v' . self::VERSION),
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => http_build_query($additionalParameters),
             CURLOPT_URL => $url,
+            CURLOPT_HTTPHEADER => array('Expect:'),
         );
 
         if (!$this->sslVerify) {
@@ -541,24 +542,35 @@ class Bitrix24 implements iBitrix24
         $curlResult = false;
         $retriesCnt = $this->retriesToConnectCount;
         while ($retriesCnt--) {
-            $this->log->debug(sprintf('try [%s] to connect to host [%s]', $retriesCnt, $this->getDomain()));
+            $n_of_retry = ($this->retriesToConnectCount - $retriesCnt);
+            $sleep = ($this->getRetriesToConnectTimeout()) * $n_of_retry * $n_of_retry; // Tempo de espera em microssegundos
+            $wait = $sleep/1000000; // Tempo de espera em segundos (p/ log)
+
+            $this->log->error(sprintf('try [%s] to connect to host [%s]', $retriesCnt, $this->getDomain()));
             $curlResult = curl_exec($curl);
             // handling network I/O errors
             if (false === $curlResult) {
                 $curlErrorNumber = curl_errno($curl);
                 $errorMsg = sprintf('in try[%s] cURL error (code %s): %s' . PHP_EOL, $retriesCnt, $curlErrorNumber,
                     curl_error($curl));
-                if (false === in_array($curlErrorNumber, $retryableErrorCodes, true) || !$retriesCnt) {
+                if (!$retriesCnt) {
                     $this->log->error($errorMsg, $this->getErrorContext());
                     curl_close($curl);
                     throw new Bitrix24IoException($errorMsg);
                 } else {
                     $this->log->warning($errorMsg, $this->getErrorContext());
                 }
-                usleep($this->getRetriesToConnectTimeout());
+                Log::debug("Curl response false. Tentativa $n_of_retry... Aguardando $wait segundos");
+                usleep($sleep);
                 continue;
             }
             $this->requestInfo = curl_getinfo($curl);
+
+            if ($this->requestInfo['http_code'] == 504) {
+                Log::debug("Erro 504! Tentando novamente. Aguardando $wait segundos");
+                usleep($sleep);
+                continue;
+            }
             $this->rawResponse = $curlResult;
             $this->log->debug('cURL request info', array($this->getRequestInfo()));
             curl_close($curl);
@@ -589,9 +601,11 @@ class Bitrix24 implements iBitrix24
 
         // handling json_decode errors
         $jsonResult = json_decode($curlResult, true);
-        unset($curlResult);
         $jsonErrorCode = json_last_error();
         if (null === $jsonResult && (JSON_ERROR_NONE !== $jsonErrorCode)) {
+            Log::error($curlResult);
+            Log::error($this->requestInfo);
+            unset($curlResult);
             /**
              * @todo add function json_last_error_msg()
              */
